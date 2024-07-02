@@ -5,12 +5,11 @@ import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split, GridSearchCV
 from sklearn.metrics import accuracy_score
-import time
 import random
 import numpy as np
 import os
 import joblib
-
+####
 # Default arguments for the DAG
 default_args = {
     'owner': 'airflow',
@@ -95,17 +94,18 @@ def train_model_and_save(data, model_filename="trained_firewall_model.pkl"):
         if accuracy >= 0.60:
             print("Model meets the accuracy requirement. Saving the model.")
             joblib.dump(best_rf, model_filename)
-            return best_rf, True
+            return model_filename, True
         else:
             print("Model does not meet the accuracy requirement. Retrying...")
-            return best_rf, False
+            return model_filename, False
     else:
         print("No data available for training.")
         return None, False
 
-def generate_rules(model, data):
+def generate_rules(model_filename, data):
     """Generate firewall rules based on model predictions and data features."""
-    if model and not data.empty:
+    if model_filename and os.path.exists(model_filename) and not data.empty:
+        model = joblib.load(model_filename)
         feature_df = pd.DataFrame(columns=pd.get_dummies(data[['port', 'ip', 'traffic_type']]).columns)
         rules = []
         for index, row in data.iterrows():
@@ -203,7 +203,7 @@ train_model_task = PythonOperator(
 generate_rules_task = PythonOperator(
     task_id='generate_rules',
     python_callable=generate_rules,
-    op_args=[train_model_task.output],
+    op_args=['/Users/tamilselvans/airflow/dags/trained_firewall_model.pkl', combine_data_task.output],
     dag=dag,
 )
 
