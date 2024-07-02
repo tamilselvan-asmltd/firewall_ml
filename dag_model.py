@@ -9,7 +9,7 @@ import random
 import numpy as np
 import os
 import joblib
-####
+
 # Default arguments for the DAG
 default_args = {
     'owner': 'airflow',
@@ -28,7 +28,7 @@ dag = DAG(
 
 # Function definitions
 
-def generate_random_traffic(port_weights, ip_weights, traffic_type_weights, action_weights):
+def generate_random_traffic(port_weights, ip_weights, traffic_type_weights, action_weights, **kwargs):
     """Generate random traffic data with weighted probabilities."""
     ports = [random.randint(1000, 9999) for _ in range(50)]
     ips = [f"192.168.1.{i}" for i in range(1, 9)]
@@ -42,31 +42,42 @@ def generate_random_traffic(port_weights, ip_weights, traffic_type_weights, acti
         "action": np.random.choice(actions, p=action_weights)
     } for _ in range(50)]
 
-    return data
+    kwargs['ti'].xcom_push(key='traffic_data', value=data)
 
-def load_data(input_data):
+def load_data(**kwargs):
     """Load data from a list of dictionaries."""
-    return pd.DataFrame(input_data)
+    ti = kwargs['ti']
+    input_data = ti.xcom_pull(key='traffic_data', task_ids='traffic')
+    df = pd.DataFrame(input_data)
+    ti.xcom_push(key='loaded_data', value=df.to_dict(orient='records'))
 
-def load_user_feedback(filename="user_feedback.csv"):
+def load_user_feedback(filename="user_feedback.csv", **kwargs):
     """Load user feedback from a CSV file."""
     if os.path.isfile(filename):
-        return pd.read_csv(filename).to_dict(orient='records')
+        feedback_data = pd.read_csv(filename).to_dict(orient='records')
     else:
         print(f"Feedback file {filename} does not exist.")
-        return []
+        feedback_data = []
+    kwargs['ti'].xcom_push(key='feedback_data', value=feedback_data)
 
-def combine_data_with_feedback(data, feedback_data):
+def combine_data_with_feedback(**kwargs):
     """Combine the main data with user feedback, prioritizing feedback."""
-    if feedback_data:
-        feedback_df = pd.DataFrame(feedback_data)
-        combined = pd.concat([data, feedback_df]).drop_duplicates(subset=['port', 'ip', 'traffic_type'], keep='last')
-        return combined
+    ti = kwargs['ti']
+    data = pd.DataFrame(ti.xcom_pull(key='loaded_data', task_ids='firewall'))
+    feedback_data = pd.DataFrame(ti.xcom_pull(key='feedback_data', task_ids='user_feedback'))
+    
+    if not feedback_data.empty:
+        combined = pd.concat([data, feedback_data]).drop_duplicates(subset=['port', 'ip', 'traffic_type'], keep='last')
     else:
-        return data
+        combined = data
 
-def train_model_and_save(data, model_filename="trained_firewall_model.pkl"):
+    ti.xcom_push(key='combined_data', value=combined.to_dict(orient='records'))
+
+def train_model_and_save(**kwargs):
     """Train a random forest model with hyperparameter tuning on the given data and save it."""
+    ti = kwargs['ti']
+    data = pd.DataFrame(ti.xcom_pull(key='combined_data', task_ids='firewall_logs_and_user_feedback'))
+    
     if not data.empty:
         X = pd.get_dummies(data[['port', 'ip', 'traffic_type']])
         y = data['action']
@@ -91,19 +102,25 @@ def train_model_and_save(data, model_filename="trained_firewall_model.pkl"):
         accuracy = accuracy_score(y_test, y_pred)
         print(f"Model accuracy: {accuracy:.2%}")
 
+        model_filename = '/Users/tamilselvans/airflow/dags/trained_firewall_model.pkl'
+
         if accuracy >= 0.60:
             print("Model meets the accuracy requirement. Saving the model.")
             joblib.dump(best_rf, model_filename)
-            return model_filename, True
+            ti.xcom_push(key='model_filename', value=model_filename)
         else:
             print("Model does not meet the accuracy requirement. Retrying...")
-            return model_filename, False
+            ti.xcom_push(key='model_filename', value=None)
     else:
         print("No data available for training.")
-        return None, False
+        ti.xcom_push(key='model_filename', value=None)
 
-def generate_rules(model_filename, data):
+def generate_rules(**kwargs):
     """Generate firewall rules based on model predictions and data features."""
+    ti = kwargs['ti']
+    model_filename = ti.xcom_pull(key='model_filename', task_ids='adaptive_ML_model')
+    data = pd.DataFrame(ti.xcom_pull(key='combined_data', task_ids='firewall_logs_and_user_feedback'))
+
     if model_filename and os.path.exists(model_filename) and not data.empty:
         model = joblib.load(model_filename)
         feature_df = pd.DataFrame(columns=pd.get_dummies(data[['port', 'ip', 'traffic_type']]).columns)
@@ -118,45 +135,29 @@ def generate_rules(model_filename, data):
                 "ip": row['ip'],
                 "traffic_type": row['traffic_type']
             })
-        return rules
+        ti.xcom_push(key='rules', value=rules)
     else:
         print("No model or data available to generate rules.")
-        return []
+        ti.xcom_push(key='rules', value=[])
 
-def save_rules_to_csv(rules, filename="firewall_rules.csv"):
+def save_rules_to_csv(**kwargs):
     """Save firewall rules to a CSV file."""
+    ti = kwargs['ti']
+    rules = ti.xcom_pull(key='rules', task_ids='ML_Predicted_rule')
     df = pd.DataFrame(rules)
+    filename = "firewall_rules.csv"
+    df.to_csv(filename, mode='w', header=True, index=False)
+
+def update_firewall_rules(**kwargs):
+    """Update firewall rules in a CSV file."""
+    ti = kwargs['ti']
+    rules = ti.xcom_pull(key='rules', task_ids='ML_Predicted_rule')
+    df = pd.DataFrame(rules)
+    filename = "firewall_rules.csv"
     if os.path.isfile(filename):
         df.to_csv(filename, mode='a', header=False, index=False)
     else:
         df.to_csv(filename, index=False)
-
-def update_firewall_rules(rules, filename="firewall_rules.csv"):
-    """Update firewall rules in a CSV file."""
-    df = pd.DataFrame(rules)
-    df.to_csv(filename, index=False)
-
-def apply_firewall_rules(rules, log_filename="firewall_log.csv"):
-    """Simulate applying firewall rules and log the actions."""
-    print("Applying firewall rules:")
-    log_entries = []
-    for rule in rules:
-        print(f"{rule['action']} traffic on port {rule['port']} from IP {rule['ip']} with type {rule['traffic_type']}")
-        log_entries.append(rule)
-
-    log_df = pd.DataFrame(log_entries)
-    if os.path.isfile(log_filename):
-        log_df.to_csv(log_filename, mode='a', header=False, index=False)
-    else:
-        log_df.to_csv(log_filename, index=False)
-
-def log_user_feedback(feedback_data, log_filename="user_feedback_log.csv"):
-    """Log user feedback to a CSV file."""
-    feedback_df = pd.DataFrame(feedback_data)
-    if os.path.isfile(log_filename):
-        feedback_df.to_csv(log_filename, mode='a', header=False, index=False)
-    else:
-        feedback_df.to_csv(log_filename, index=False)
 
 # Initial weights for random generation
 port_weights = [1/50] * 50
@@ -167,82 +168,65 @@ action_weights = [0.5, 0.5]
 # Define Airflow tasks
 
 generate_traffic_task = PythonOperator(
-    task_id='generate_traffic',
+    task_id='traffic',
     python_callable=generate_random_traffic,
     op_args=[port_weights, ip_weights, traffic_type_weights, action_weights],
+    provide_context=True,
     dag=dag,
 )
 
 load_data_task = PythonOperator(
-    task_id='load_data',
+    task_id='firewall',
     python_callable=load_data,
-    op_args=[generate_traffic_task.output],
+    provide_context=True,
     dag=dag,
 )
 
 load_feedback_task = PythonOperator(
-    task_id='load_user_feedback',
+    task_id='user_feedback',
     python_callable=load_user_feedback,
+    provide_context=True,
     dag=dag,
 )
 
 combine_data_task = PythonOperator(
-    task_id='combine_data_with_feedback',
+    task_id='firewall_logs_and_user_feedback',
     python_callable=combine_data_with_feedback,
-    op_args=[load_data_task.output, load_feedback_task.output],
+    provide_context=True,
     dag=dag,
 )
 
 train_model_task = PythonOperator(
-    task_id='train_model_and_save',
+    task_id='adaptive_ML_model',
     python_callable=train_model_and_save,
-    op_args=[combine_data_task.output, '/Users/tamilselvans/airflow/dags/trained_firewall_model.pkl'],
+    provide_context=True,
     dag=dag,
 )
 
 generate_rules_task = PythonOperator(
-    task_id='generate_rules',
+    task_id='ML_Predicted_rule',
     python_callable=generate_rules,
-    op_args=['/Users/tamilselvans/airflow/dags/trained_firewall_model.pkl', combine_data_task.output],
+    provide_context=True,
     dag=dag,
 )
 
 save_rules_task = PythonOperator(
-    task_id='save_rules_to_csv',
+    task_id='updated_rule',
     python_callable=save_rules_to_csv,
-    op_args=[generate_rules_task.output],
+    provide_context=True,
     dag=dag,
 )
 
 update_rules_task = PythonOperator(
     task_id='update_firewall_rules',
     python_callable=update_firewall_rules,
-    op_args=[generate_rules_task.output],
-    dag=dag,
-)
-
-apply_rules_task = PythonOperator(
-    task_id='apply_firewall_rules',
-    python_callable=apply_firewall_rules,
-    op_args=[generate_rules_task.output],
-    dag=dag,
-)
-
-log_feedback_task = PythonOperator(
-    task_id='log_user_feedback',
-    python_callable=log_user_feedback,
-    op_args=[load_feedback_task.output],
+    provide_context=True,
     dag=dag,
 )
 
 # Define task dependencies
-generate_traffic_task >> load_data_task
-load_data_task >> load_feedback_task
-[load_data_task, load_feedback_task] >> combine_data_task
-combine_data_task >> train_model_task
-train_model_task >> generate_rules_task
-generate_rules_task >> [save_rules_task, update_rules_task, apply_rules_task]
-load_feedback_task >> log_feedback_task
+generate_traffic_task >> load_data_task >> load_feedback_task >> combine_data_task >> train_model_task
+train_model_task >> generate_rules_task >> [save_rules_task, update_rules_task]
 
 if __name__ == "__main__":
     dag.cli()
