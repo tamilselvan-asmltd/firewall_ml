@@ -225,7 +225,8 @@ update_rules_task = PythonOperator(
 )
 
 # Define task dependencies
-generate_traffic_task >> load_data_task >> load_feedback_task >> combine_data_task >> train_model_task
+generate_traffic_task >> load_data_task >> combine_data_task >> train_model_task
+load_feedback_task >> combine_data_task
 train_model_task >> generate_rules_task >> [save_rules_task, update_rules_task]
 
 if __name__ == "__main__":
